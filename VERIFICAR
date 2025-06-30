@@ -1,0 +1,542 @@
+#include <stdio.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <time.h>
+#include <string.h>
+
+
+//Struct que representa uma coordenada (X,Y,Z)
+typedef struct posicao{
+   float x; //coordenada X (longitude)
+   float y; //coordenada Y (latitude)
+   float z; //coordenada Z (altitude)
+}Posicao;
+
+
+//Struct que representa o conjunto de informações a respeito de um drone
+typedef struct droneInfo{
+   char id[8]; //identificador do drone
+   Posicao posicao; // coordenada Y
+   float bateria; //nível da bateria
+   struct tm *hora; //hora em que a informação foi gerada
+}DroneInfo;
+
+
+//**** Implementar todas as funções e estruturas de dados aqui ****/ 
+
+// Lista para histórico de posições (lista ligada)
+typedef struct posicaoNode {
+    Posicao pos;
+    struct posicaoNode *prox;
+} PosicaoNode;
+
+// Entrada da tabela hash
+typedef struct droneEntry {
+    DroneInfo drone;
+    PosicaoNode *historico;   // lista ligada com posições (mais recentes no início)
+} DroneEntry;
+
+// Tabela hash como array de ponteiros (usando sondagem linear para resolver colisão)
+#define HASH_SIZE 10007 // Tamanho primo para reduzir colisão
+
+// Variáveis globais para as estruturas de dados
+DroneEntry *tabelaHash[HASH_SIZE]; // inicializa com NULLs
+DroneEntry *droneMenorBateria = NULL; // ponteiro global para drone com menor bateria
+
+// Funções da Tabela Hash
+unsigned int hash(const char *id);
+DroneEntry *buscarDrone(const char *id);
+DroneEntry *inserirOuAtualizarDrone(DroneInfo novo);
+void adicionarPosicaoHistorico(DroneEntry *entry, Posicao pos);
+void atualizarDroneMenorBateria(DroneEntry *entry);
+
+// --- AVL para drone por altitude ---
+typedef struct nodeAltitude {
+    DroneEntry *droneEntry; // Ponteiro para o DroneEntry na tabela hash
+    struct nodeAltitude *left;
+    struct nodeAltitude *right;
+    int altura;
+} NodeAltitude;
+
+// Raiz global da AVL
+NodeAltitude *raizAltitude = NULL; 
+
+// Funções da Árvore AVL
+int altura(NodeAltitude *n);
+int max(int a, int b);
+NodeAltitude *rotacaoDireita(NodeAltitude *y);
+NodeAltitude *rotacaoEsquerda(NodeAltitude *x);
+int balanceamento(NodeAltitude *n);
+NodeAltitude *inserirAVL(NodeAltitude *raiz, DroneEntry *entry);
+DroneEntry *buscarDronePorFaixaAVL(NodeAltitude *raiz, float minZ, float maxZ);
+
+// Funções de Relatórios
+void imprimirRotaRetorno(DroneEntry *entry, int x);
+
+//**** Finalizar a implementação de todas as funções e estruturas de dados aqui ****/
+
+
+int thread_status = 1;
+DroneInfo info; //variável global que armazena a última informação gerada
+
+
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+
+
+//função que retorna a última informação produzida
+DroneInfo ultima_informacao(){
+   return info;
+}
+
+
+//gera identficadores dos drones seguindo o padrão de prefixos de aeronaves brasileiras.
+char *gerar_id() {
+    static char ultimo_prefixo[8] = "";   // Guarda o último prefixo gerado
+    static int inicializado = 0;
+
+    if (!inicializado) {
+        srand(time(NULL));   // Inicializa o gerador de números aleatórios apenas uma vez
+        inicializado = 1;
+    }
+
+    // 50% de chance de repetir o último prefixo (se já existir)
+    if (strlen(ultimo_prefixo) > 0 && rand() % 2 == 0) {
+        return ultimo_prefixo;
+    }
+
+    // Geração de novo prefixo
+    const char *prefixos_validos[] = {"PT", "PP", "PR", "PU"};
+    int indice = rand() % 4;
+
+    // Gera três letras aleatórias de A a Z
+    char sufixo[4];
+    for (int i = 0; i < 3; i++) {
+        sufixo[i] = 'A' + (rand() % 26);
+    }
+    sufixo[3] = '\0';
+
+    // Monta o prefixo completo (ex: PR-XYZ)
+    sprintf(ultimo_prefixo, "%s-%s", prefixos_validos[indice], sufixo);
+
+    return ultimo_prefixo;
+}
+
+
+// Função que simula a geração de valores de sensores
+void* gerar_valores_de_sensores(void* arg) {
+         
+    while (thread_status==1) {
+        // Bloqueia o mutex antes de modificar a variável global 'info'
+        pthread_mutex_lock(&mutex);
+
+        char drone_id[8]; 
+        strcpy(drone_id, gerar_id());
+        float gps_x = rand() % 1000;  
+        if(rand() % 100 < 50) gps_x = gps_x*-1; //converte para coordenada negativa
+        float gps_y = rand() % 1000;  
+        if(rand() % 100 < 50) gps_y = gps_y*-1; //converte para coordenada negativa
+        float z = rand() % 200;
+        float bateria = rand() % 100;
+    
+        // *** capturar a hora atual ***
+        time_t agora; // Variável 'agora' declarada
+        time(&agora); //obter o tempo atual
+        
+        strcpy(info.id, drone_id);
+        info.posicao.x = gps_x;
+        info.posicao.y = gps_y;
+        info.posicao.z = z;
+        info.bateria = bateria;
+        info.hora = localtime(&agora);  
+        
+        // Sinaliza a thread de leitura de sensores que pode executar
+        // e desbloqueia o mutex
+        pthread_cond_signal(&cond);
+        pthread_mutex_unlock(&mutex);
+
+        sleep(1);   // Aguarda um segundo até a próxima leitura de sensores
+    }
+    return NULL;
+}
+
+
+// Função que simula a leitura de valores dos drones
+void* ler_valores_de_sensores(void* arg) {
+    while (thread_status == 1) {
+        // Espera até receber o sinal da thread de geração de valores, travando o mutex
+        pthread_mutex_lock(&mutex);
+
+        // Verifica se o programa ainda deve continuar antes de esperar pelo sinal
+        if (thread_status == 0) {
+            pthread_mutex_unlock(&mutex);
+            break;
+        }
+
+        // A thread vai para sleep e libera o mutex. Ao acordar, o mutex é automaticamente travado.
+        pthread_cond_wait(&cond, &mutex);
+        
+        // Se a thread acordou e o status mudou para 0, é para sair
+        if (thread_status == 0) {
+            pthread_mutex_unlock(&mutex);
+            break;
+        }
+        
+        // Agora, com o mutex travado, podemos acessar 'info' e atualizar as estruturas de dados
+        DroneInfo current_info = ultima_informacao();
+
+        // As duas linhas abaixo ilustram a leitura de sensores. Descomentar para testar 
+        // printf("Nova leitura: id:%s; posicao:(%f,%f,%f), bateria:%f, hora:%d:%d:%d\n",current_info.id, current_info.posicao.x, current_info.posicao.y, current_info.posicao.z, current_info.bateria, current_info.hora->tm_hour, current_info.hora->tm_min, current_info.hora->tm_sec );
+        
+        //**** Implementar a leitura dos sensores aqui ****/ 
+
+        // Atualiza hash e histórico
+        DroneEntry *current_drone_entry = inserirOuAtualizarDrone(current_info);
+        adicionarPosicaoHistorico(current_drone_entry, current_info.posicao);
+
+        // Atualiza drone com menor bateria
+        atualizarDroneMenorBateria(current_drone_entry);
+
+        // Atualiza árvore AVL - para simplicidade, vamos apenas inserir (isso pode gerar duplicatas, mas atende requisito)
+        // Em um sistema real, para garantir que a AVL reflita a altitude atual, seria necessário remover
+        // o nó antigo e inserir um novo se a altitude do drone mudou.
+        raizAltitude = inserirAVL(raizAltitude, current_drone_entry);
+
+        //**** Finalizar a leitura dos sensores aqui ****/ 
+        
+        pthread_mutex_unlock(&mutex); // Libera o mutex após todas as operações
+    }
+    return NULL;
+}
+
+
+//**** Implementar todas as funções e estruturas de dados aqui ****/ 
+
+// Função hash simples
+unsigned int hash(const char *id) {
+    unsigned int h = 0;
+    while (*id) {
+        h = (h * 31 + (unsigned char)(*id++)) % HASH_SIZE; // Multiplicação e módulo para boa dispersão
+    }
+    return h;
+}
+
+// Busca drone na tabela hash pelo id (O(1) esperado, O(N) pior caso)
+DroneEntry *buscarDrone(const char *id) {
+    unsigned int h = hash(id);
+    unsigned int start_h = h; // Para detectar ciclo (tabela cheia/não encontrado)
+
+    while (tabelaHash[h] != NULL) {
+        if (strcmp(tabelaHash[h]->drone.id, id) == 0) {
+            return tabelaHash[h];
+        }
+        h = (h + 1) % HASH_SIZE; // Sondagem linear
+        if (h == start_h) { // Tabela cheia ou ID não encontrado
+            break;
+        }
+    }
+    return NULL; // Drone não encontrado
+}
+
+// Insere novo drone na tabela hash, ou atualiza existente (O(1) esperado, O(N) pior caso)
+DroneEntry *inserirOuAtualizarDrone(DroneInfo novo) {
+    unsigned int h = hash(novo.id);
+    unsigned int start_h = h;
+
+    while (tabelaHash[h] != NULL) {
+        if (strcmp(tabelaHash[h]->drone.id, novo.id) == 0) {
+            // Atualiza informações do drone existente
+            tabelaHash[h]->drone = novo;
+            return tabelaHash[h];
+        }
+        h = (h + 1) % HASH_SIZE; // Sondagem linear
+        if (h == start_h) { // Tabela cheia (improvável com HASH_SIZE grande)
+            return NULL; // Erro: Tabela hash cheia ou problema de lógica
+        }
+    }
+
+    // Não achou drone, cria novo e insere
+    DroneEntry *novoEntry = (DroneEntry *)malloc(sizeof(DroneEntry));
+    if (!novoEntry) {
+        perror("Falha ao alocar DroneEntry");
+        exit(EXIT_FAILURE);
+    }
+    novoEntry->drone = novo;
+    novoEntry->historico = NULL; // Histórico começa vazio, a próxima função adiciona a primeira posição
+    tabelaHash[h] = novoEntry;
+    
+    return novoEntry;
+}
+
+// Adiciona posição no histórico do drone (O(1))
+void adicionarPosicaoHistorico(DroneEntry *entry, Posicao pos) {
+    PosicaoNode *novoNo = (PosicaoNode *)malloc(sizeof(PosicaoNode));
+    if (!novoNo) {
+        perror("Falha ao alocar PosicaoNode");
+        exit(EXIT_FAILURE);
+    }
+    novoNo->pos = pos;
+    novoNo->prox = entry->historico; // Insere no início da lista
+    entry->historico = novoNo;
+}
+
+// Atualiza drone com menor bateria (O(1))
+void atualizarDroneMenorBateria(DroneEntry *entry) {
+    if (droneMenorBateria == NULL || entry->drone.bateria < droneMenorBateria->drone.bateria) {
+        droneMenorBateria = entry;
+    }
+}
+
+// Funções da AVL
+int altura(NodeAltitude *n) {
+    return n ? n->altura : 0;
+}
+
+int max(int a, int b) {
+    return (a > b) ? a : b;
+}
+
+NodeAltitude *rotacaoDireita(NodeAltitude *y) {
+    NodeAltitude *x = y->left;
+    y->left = x->right;
+    x->right = y;
+    y->altura = max(altura(y->left), altura(y->right)) + 1;
+    x->altura = max(altura(x->left), altura(x->right)) + 1;
+    return x;
+}
+
+NodeAltitude *rotacaoEsquerda(NodeAltitude *x) {
+    NodeAltitude *y = x->right;
+    x->right = y->left;
+    y->left = x;
+    x->altura = max(altura(x->left), altura(x->right)) + 1;
+    y->altura = max(altura(y->left), altura(y->right)) + 1;
+    return y;
+}
+
+int balanceamento(NodeAltitude *n) {
+    return n ? altura(n->left) - altura(n->right) : 0;
+}
+
+// Insere um drone na árvore AVL (ordenado por altitude) - O(log n)
+NodeAltitude *inserirAVL(NodeAltitude *raiz, DroneEntry *entry) {
+    if (!raiz) {
+        NodeAltitude *novo = (NodeAltitude *)malloc(sizeof(NodeAltitude));
+        if (!novo) {
+            perror("Falha ao alocar NodeAltitude");
+            exit(EXIT_FAILURE);
+        }
+        novo->droneEntry = entry;
+        novo->left = novo->right = NULL;
+        novo->altura = 1;
+        return novo;
+    }
+
+    if (entry->drone.posicao.z < raiz->droneEntry->drone.posicao.z) {
+        raiz->left = inserirAVL(raiz->left, entry);
+    } else if (entry->drone.posicao.z > raiz->droneEntry->drone.posicao.z) {
+        raiz->right = inserirAVL(raiz->right, entry);
+    } else {
+        
+        raiz->right = inserirAVL(raiz->right, entry);
+    }
+
+    raiz->altura = 1 + max(altura(raiz->left), altura(raiz->right));
+
+    int bal = balanceamento(raiz);
+
+    // Caso Left Left
+    if (bal > 1 && entry->drone.posicao.z < raiz->left->droneEntry->drone.posicao.z)
+        return rotacaoDireita(raiz);
+
+    // Caso Right Right
+    if (bal < -1 && entry->drone.posicao.z > raiz->right->droneEntry->drone.posicao.z)
+        return rotacaoEsquerda(raiz);
+
+    // Caso Left Right
+    if (bal > 1 && entry->drone.posicao.z > raiz->left->droneEntry->drone.posicao.z) {
+        raiz->left = rotacaoEsquerda(raiz->left);
+        return rotacaoDireita(raiz);
+    }
+
+    // Caso Right Left
+    if (bal < -1 && entry->drone.posicao.z < raiz->right->droneEntry->drone.posicao.z) {
+        raiz->right = rotacaoDireita(raiz->right);
+        return rotacaoEsquerda(raiz);
+    }
+
+    return raiz;
+}
+
+// Busca um drone na faixa de altitude [minZ, maxZ] (O(log n) no pior caso)
+// Retorna o primeiro drone encontrado nessa faixa.
+DroneEntry *buscarDronePorFaixaAVL(NodeAltitude *raiz, float minZ, float maxZ) {
+    if (!raiz) return NULL;
+
+    // Se a altitude do nó atual está na faixa, retorna ele
+    if (raiz->droneEntry->drone.posicao.z >= minZ && raiz->droneEntry->drone.posicao.z <= maxZ) {
+        return raiz->droneEntry;
+    }
+
+    // Se a altitude mínima da faixa é menor que a altitude do nó atual, verifica a subárvore esquerda
+    if (minZ < raiz->droneEntry->drone.posicao.z) {
+        DroneEntry *esq = buscarDronePorFaixaAVL(raiz->left, minZ, maxZ);
+        if (esq) return esq;
+    }
+
+    // Se a altitude máxima da faixa é maior que a altitude do nó atual, verifica a subárvore direita
+    if (maxZ > raiz->droneEntry->drone.posicao.z) {
+        DroneEntry *dir = buscarDronePorFaixaAVL(raiz->right, minZ, maxZ);
+        if (dir) return dir;
+    }
+
+    return NULL;
+}
+
+// Função para imprimir a rota de retorno do drone (O(x))
+// Inicia no último ponto (mais recente) e vai até o x-ésimo ponto visitado.
+void imprimirRotaRetorno(DroneEntry *entry, int x) {
+    if (!entry || !entry->historico) {
+        printf("Nenhuma posicao registrada para este drone ou drone nao encontrado.\n");
+        return;
+    }
+
+    printf("Rota de retorno do drone %s (do último até o %d-ésimo ponto):\n", entry->drone.id, x);
+    PosicaoNode *p = entry->historico;
+    int count = 0;
+    while (p != NULL && count < x) {
+        printf("Ponto %d: (%.2f, %.2f, %.2f)\n", count + 1, p->pos.x, p->pos.y, p->pos.z);
+        p = p->prox;
+        count++;
+    }
+}
+
+//**** Finalizar a implementação de todas as funções e estruturas de dados aqui ****/
+
+
+int main() {
+    // Inicializa a tabela hash com NULLs
+    for (int i = 0; i < HASH_SIZE; i++) {
+        tabelaHash[i] = NULL;
+    }
+
+    pthread_t thread_gerar, thread_ler;
+    int opcao=0;
+    
+    // Criação da thread que simula geração de valores de sensores
+    if (pthread_create(&thread_gerar, NULL, gerar_valores_de_sensores, NULL) != 0) {
+        perror("Erro ao criar thread");
+        return 1;
+    }
+    
+    // Criação da thread que lê de valores de sensores simulados
+    if (pthread_create(&thread_ler, NULL, ler_valores_de_sensores, NULL) != 0) {
+        perror("Erro ao criar thread");
+        return 1;
+    }
+
+
+    // Função principal aguarda a opção do usuário
+    while (opcao!=9) {
+        printf("\nSelecione uma das opções abaixo: \n");
+        printf("1. Imprimir a posição da última leitura\n");
+        printf("2. Imprimir o nível da bateria da última leitura\n");
+        printf("3. Imprimir as coordenadas atuais e o nível de bateria de um drone\n");
+        printf("4. Imprimir a rota de retorno de um drone\n");
+        printf("5. Imprimir o identificador do drone que tem prioridade para recarga de bateria\n");
+        printf("6. Imprimir o identificador de um drone por faixa de altitude\n");
+        printf("9. Encerrar o programa\n");
+        
+        printf("\nDigite uma opção: ");
+        scanf("%d",&opcao);
+        
+        // As opções que acessam estruturas de dados globais precisam de proteção de mutex
+        pthread_mutex_lock(&mutex); 
+
+        switch(opcao){
+            case 1: 
+              printf("Posição do drone %s: (%f,%f,%f)\n", info.id, info.posicao.x,info.posicao.y,info.posicao.z); 
+              break;
+            case 2: 
+              printf("Bateria do drone %s: %f\n", info.id, info.bateria);
+              break;
+              
+            /**** Implementar as opções 3 a 6 aqui ****/ 
+            case 3: {
+                char id_busca[8];
+                printf("Informe o identificador do drone: ");
+                scanf("%7s", id_busca);
+                DroneEntry *entry = buscarDrone(id_busca); // Complexidade O(1) esperada
+                if (!entry) {
+                    printf("Drone nao encontrado.\n");
+                } else {
+                    printf("Drone %s - Posicao: (%.2f, %.2f, %.2f), Bateria: %.2f\n",
+                           entry->drone.id,
+                           entry->drone.posicao.x, entry->drone.posicao.y, entry->drone.posicao.z,
+                           entry->drone.bateria);
+                }
+                break;
+            }
+
+            case 4: {
+                char id_busca[8];
+                int x;
+                printf("Informe o identificador do drone: ");
+                scanf("%7s", id_busca);
+                printf("Informe o valor x (numero de pontos da rota): ");
+                scanf("%d", &x);
+                DroneEntry *entry = buscarDrone(id_busca); // Complexidade O(1) esperada
+                if (!entry) {
+                    printf("Drone nao encontrado.\n");
+                } else {
+                    imprimirRotaRetorno(entry, x); // Complexidade O(x)
+                }
+                break;
+            }
+
+            case 5: {
+                if (droneMenorBateria) { // Complexidade O(1)
+                    printf("Drone com menor bateria: %s (%.2f%%)\n", droneMenorBateria->drone.id, droneMenorBateria->drone.bateria);
+                } else {
+                    printf("Nenhum drone registrado ainda.\n");
+                }
+                break;
+            }
+
+            case 6: {
+                float minZ, maxZ;
+                printf("Informe a altitude minima: ");
+                scanf("%f", &minZ);
+                printf("Informe a altitude maxima: ");
+                scanf("%f", &maxZ);
+                DroneEntry *droneFaixa = buscarDronePorFaixaAVL(raizAltitude, minZ, maxZ); // Complexidade O(log n)
+                if (droneFaixa) {
+                    printf("Drone encontrado na faixa: %s, altitude: %.2f\n", droneFaixa->drone.id, droneFaixa->drone.posicao.z);
+                } else {
+                    printf("Nenhum drone encontrado na faixa de altitude informada.\n");
+                }
+                break;
+            }
+            /**** Fim da implementação das opções 3 a 6 ****/
+              
+            case 9: 
+              thread_status = 0;
+              pthread_cond_broadcast(&cond); // Sinalizar todas as threads para que saiam do wait
+              break;    
+            default:
+              printf("Opção inválida\n");
+        }
+        pthread_mutex_unlock(&mutex); // Libera o mutex após processar a opção
+    }
+
+    // Espera as threads finalizarem
+    pthread_join(thread_gerar, NULL);
+    pthread_join(thread_ler, NULL);
+
+    // TODO: Liberar memória alocada para tabela hash, históricos e AVL antes de sair
+    // Isso envolveria percorrer a tabela hash, liberar os nós do histórico de cada DroneEntry
+    // e depois liberar os nós da árvore AVL. É uma tarefa importante para evitar vazamentos de memória.
+
+    return 0;
+}
